@@ -36,13 +36,17 @@
     import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
     // ───────────── Configuración ─────────────
-    // Cambia el texto aquí o con la URL: index.html?text=TU%20MARCA
+    // LOGO: imagen de la que salen las partículas (fondo liso o transparente).
+    // Si no carga, se usa TEXT. También: index.html?text=TU%20MARCA fuerza el modo texto.
     const params = new URLSearchParams(location.search);
-    const TEXT = (params.get('text') || 'BRAND').slice(0, 24);
-    const PALETTE = ['#3fd0ff', '#7b6bff', '#ff5fa2'];   // gradiente de izquierda a derecha
+    const LOGO = params.get('text') ? null : 'logo.jpg';
+    const TEXT = (params.get('text') || 'PARBOK').slice(0, 24);
+    const PALETTE = ['#5fae7f', '#9fd3a8', '#f0782e'];   // polvo de fondo y modo texto
+    const MIN_LIGHTNESS = 0.4;    // aclara los tonos oscuros del logo para que brillen sobre fondo oscuro
+    const BG = 0x050b08;
 
     const isMobile = matchMedia('(pointer: coarse)').matches;
-    const COUNT   = isMobile ? 7000 : 16000;   // partículas del logo
+    const COUNT   = isMobile ? 11000 : 24000;  // partículas del logo
     const AMBIENT = isMobile ? 700  : 1800;    // polvo de fondo
 
     // ───────────── Escena ─────────────
@@ -52,13 +56,14 @@
     document.body.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
-    scene.fog = new THREE.FogExp2(0x05060a, 0.006);
+    scene.fog = new THREE.FogExp2(BG, 0.006);
+    document.body.style.background = '#' + BG.toString(16).padStart(6, '0');
     const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 500);
     camera.position.set(0, 0, 60);
 
     const composer = new EffectComposer(renderer);
     composer.addPass(new RenderPass(scene, camera));
-    const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.9, 0.55, 0.05);
+    const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.7, 0.5, 0.08);
     composer.addPass(bloom);
     composer.addPass(new OutputPass());
 
@@ -103,6 +108,63 @@
       return out;
     }
 
+    // ───────────── Muestreo de la imagen ─────────────
+    // Quita el color de fondo (tomado de las esquinas) y toma puntos de lo que queda,
+    // cada uno con el color de su píxel.
+    function loadImage(src) {
+      return new Promise((ok, fail) => { const im = new Image(); im.onload = () => ok(im); im.onerror = fail; im.src = src; });
+    }
+
+    function sampleImage(img, count) {
+      const S = 700;
+      const W = S, H = Math.round(S * img.height / img.width);
+      const c = document.createElement('canvas');
+      c.width = W; c.height = H;
+      const ctx = c.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0, W, H);
+      const d = ctx.getImageData(0, 0, W, H).data;
+
+      // Fondo = promedio de las cuatro esquinas
+      let br = 0, bg = 0, bb = 0;
+      for (const [x, y] of [[2, 2], [W - 3, 2], [2, H - 3], [W - 3, H - 3]]) {
+        const k = (y * W + x) * 4; br += d[k]; bg += d[k + 1]; bb += d[k + 2];
+      }
+      br /= 4; bg /= 4; bb /= 4;
+
+      const px = [], cols = [];
+      let minX = W, maxX = 0, minY = H, maxY = 0;
+      for (let y = 0; y < H; y++)
+        for (let x = 0; x < W; x++) {
+          const k = (y * W + x) * 4;
+          if (d[k + 3] < 128) continue;
+          const diff = Math.abs(d[k] - br) + Math.abs(d[k + 1] - bg) + Math.abs(d[k + 2] - bb);
+          if (diff < 60) continue;
+          px.push(x, y); cols.push(d[k], d[k + 1], d[k + 2]);
+          if (x < minX) minX = x; if (x > maxX) maxX = x;
+          if (y < minY) minY = y; if (y > maxY) maxY = y;
+        }
+
+      const n = px.length / 2;
+      if (n < 50) return null;
+      const size = Math.max(maxX - minX, maxY - minY);
+      const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+      const base = new Float32Array(count * 3);
+      const colors = new Float32Array(count * 3);
+      const hsl = {};
+      for (let i = 0; i < count; i++) {
+        const k = (Math.random() * n) | 0;
+        base[i * 3]     = (px[k * 2] + Math.random() - 0.5 - cx) / size;
+        base[i * 3 + 1] = -(px[k * 2 + 1] + Math.random() - 0.5 - cy) / size;
+        base[i * 3 + 2] = (Math.random() - 0.5) * 0.02;
+        tmp.setRGB(cols[k * 3] / 255, cols[k * 3 + 1] / 255, cols[k * 3 + 2] / 255, THREE.SRGBColorSpace);
+        tmp.getHSL(hsl);
+        if (hsl.l < MIN_LIGHTNESS) tmp.setHSL(hsl.h, hsl.s * 0.9, MIN_LIGHTNESS + hsl.l * 0.3);
+        const shade = 0.8 + Math.random() * 0.3;
+        colors[i * 3] = tmp.r * shade; colors[i * 3 + 1] = tmp.g * shade; colors[i * 3 + 2] = tmp.b * shade;
+      }
+      return { base, colors, aspect: (maxX - minX) / Math.max(1, maxY - minY) };
+    }
+
     // ───────────── Material de partículas ─────────────
     const particleMaterial = (size) => new THREE.ShaderMaterial({
       uniforms: { uSize: { value: size }, uPR: { value: renderer.getPixelRatio() } },
@@ -137,16 +199,21 @@
     });
 
     // ───────────── Partículas del logo ─────────────
-    const base = sampleText(TEXT, COUNT);
+    const pal = PALETTE.map(c => new THREE.Color(c));
+    const tmp = new THREE.Color();
+
+    const img = LOGO ? await loadImage(LOGO).catch(() => null) : null;
+    const sampled = img ? sampleImage(img, COUNT) : null;
+    const base = sampled ? sampled.base : sampleText(TEXT, COUNT);
+    const logoAspect = sampled ? sampled.aspect : 4;
+    const colors = sampled ? sampled.colors : new Float32Array(COUNT * 3);
+
     const pos = new Float32Array(COUNT * 3);
     const vel = new Float32Array(COUNT * 3);
     const energy = new Float32Array(COUNT);
-    const colors = new Float32Array(COUNT * 3);
     const sizes = new Float32Array(COUNT);
     const phase = new Float32Array(COUNT);
 
-    const pal = PALETTE.map(c => new THREE.Color(c));
-    const tmp = new THREE.Color();
     for (let i = 0; i < COUNT; i++) {
       // Empiezan dispersas en una esfera grande y se ensamblan
       const r = 60 + Math.random() * 60;
@@ -155,11 +222,13 @@
       pos[i * 3 + 1] = r * Math.sin(ph) * Math.sin(th);
       pos[i * 3 + 2] = r * Math.cos(ph);
 
-      const t = THREE.MathUtils.clamp(base[i * 3] + 0.5, 0, 1) * (pal.length - 1);
-      const j = Math.min(pal.length - 2, Math.floor(t));
-      tmp.copy(pal[j]).lerp(pal[j + 1], t - j);
-      const shade = 0.75 + Math.random() * 0.35;
-      colors[i * 3] = tmp.r * shade; colors[i * 3 + 1] = tmp.g * shade; colors[i * 3 + 2] = tmp.b * shade;
+      if (!sampled) {   // modo texto: gradiente de la paleta
+        const t = THREE.MathUtils.clamp(base[i * 3] + 0.5, 0, 1) * (pal.length - 1);
+        const j = Math.min(pal.length - 2, Math.floor(t));
+        tmp.copy(pal[j]).lerp(pal[j + 1], t - j);
+        const shade = 0.75 + Math.random() * 0.35;
+        colors[i * 3] = tmp.r * shade; colors[i * 3 + 1] = tmp.g * shade; colors[i * 3 + 2] = tmp.b * shade;
+      }
 
       sizes[i] = 0.6 + Math.random() * 0.9;
       phase[i] = Math.random() * Math.PI * 2;
@@ -174,7 +243,7 @@
     geo.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
     geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 200);
 
-    const logo = new THREE.Points(geo, particleMaterial(isMobile ? 2.6 : 3.0));
+    const logo = new THREE.Points(geo, particleMaterial(isMobile ? 2.2 : 2.5));
     const logoGroup = new THREE.Group();
     logoGroup.add(logo);
     scene.add(logoGroup);
@@ -210,7 +279,11 @@
       bloom.setSize(w, h);
       const visH = 2 * camera.position.z * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
       const visW = visH * camera.aspect;
-      scale = Math.min(70, visW * 0.84);   // ancho del texto en unidades del mundo
+      // Tamaño del lado mayor del logo en unidades del mundo, para que quepa a lo ancho y a lo alto
+      const fitW = visW * 0.84, fitH = visH * 0.74;
+      scale = logoAspect >= 1
+        ? Math.min(70, fitW, fitH * logoAspect)
+        : Math.min(70, fitH, fitW / logoAspect);
     }
     addEventListener('resize', resize);
     resize();
