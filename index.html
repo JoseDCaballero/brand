@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>Brand · Partículas</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #05060a; overflow: hidden; }
+    canvas { display: block; touch-action: none; }
+    #hint {
+      position: fixed; left: 0; right: 0; bottom: 28px;
+      text-align: center; pointer-events: none;
+      font: 500 12px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      letter-spacing: .14em; text-transform: uppercase;
+      color: rgba(255, 255, 255, .42);
+      transition: opacity 1.2s ease;
+    }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="hint">Mueve el cursor · toca o haz clic para dispersar</div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+    import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+    // ───────────── Configuración ─────────────
+    // Cambia el texto aquí o con la URL: index.html?text=TU%20MARCA
+    const params = new URLSearchParams(location.search);
+    const TEXT = (params.get('text') || 'BRAND').slice(0, 24);
+    const PALETTE = ['#3fd0ff', '#7b6bff', '#ff5fa2'];   // gradiente de izquierda a derecha
+
+    const isMobile = matchMedia('(pointer: coarse)').matches;
+    const COUNT   = isMobile ? 7000 : 16000;   // partículas del logo
+    const AMBIENT = isMobile ? 700  : 1800;    // polvo de fondo
+
+    // ───────────── Escena ─────────────
+    const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x05060a, 0.006);
+    const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 500);
+    camera.position.set(0, 0, 60);
+
+    const composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, camera));
+    const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.9, 0.55, 0.05);
+    composer.addPass(bloom);
+    composer.addPass(new OutputPass());
+
+    // ───────────── Muestreo del texto ─────────────
+    // Dibuja el texto en un canvas 2D y toma puntos aleatorios de los píxeles rellenos.
+    function sampleText(text, count) {
+      const W = 1200, H = 360;
+      const c = document.createElement('canvas');
+      c.width = W; c.height = H;
+      const ctx = c.getContext('2d');
+      const font = s => `900 ${s}px system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif`;
+      let size = 280;
+      ctx.font = font(size);
+      const w = ctx.measureText(text).width;
+      if (w > W * 0.94) size *= (W * 0.94) / w;
+      ctx.font = font(size);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#fff';
+      ctx.fillText(text, W / 2, H / 2);
+
+      const data = ctx.getImageData(0, 0, W, H).data;
+      const STEP = 2;
+      const px = [];
+      let minX = W, maxX = 0;
+      for (let y = 0; y < H; y += STEP)
+        for (let x = 0; x < W; x += STEP)
+          if (data[(y * W + x) * 4 + 3] > 128) { px.push(x, y); minX = Math.min(minX, x); maxX = Math.max(maxX, x); }
+
+      const n = px.length / 2;
+      const textW = Math.max(1, maxX - minX);
+      const out = new Float32Array(count * 3);
+      for (let i = 0; i < count; i++) {
+        const k = (Math.random() * n) | 0;
+        const x = px[k * 2] + (Math.random() - 0.5) * STEP;
+        const y = px[k * 2 + 1] + (Math.random() - 0.5) * STEP;
+        // Normalizado: el ancho del texto mide 1 unidad
+        out[i * 3]     = (x - (minX + maxX) / 2) / textW;
+        out[i * 3 + 1] = -(y - H / 2) / textW;
+        out[i * 3 + 2] = (Math.random() - 0.5) * 0.03;
+      }
+      return out;
+    }
+
+    // ───────────── Material de partículas ─────────────
+    const particleMaterial = (size) => new THREE.ShaderMaterial({
+      uniforms: { uSize: { value: size }, uPR: { value: renderer.getPixelRatio() } },
+      vertexShader: /* glsl */`
+        attribute vec3 aColor;
+        attribute float aSize;
+        attribute float aEnergy;
+        uniform float uSize;
+        uniform float uPR;
+        varying vec3 vColor;
+        varying float vAlpha;
+        void main() {
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          gl_Position = projectionMatrix * mv;
+          float e = clamp(aEnergy, 0.0, 1.0);
+          gl_PointSize = uSize * aSize * uPR * (60.0 / -mv.z) * (1.0 + e * 0.8);
+          vColor = mix(aColor, vec3(1.0), e * 0.55);
+          vAlpha = 0.75 + e * 0.25;
+        }`,
+      fragmentShader: /* glsl */`
+        varying vec3 vColor;
+        varying float vAlpha;
+        void main() {
+          float d = length(gl_PointCoord - 0.5);
+          float a = pow(smoothstep(0.5, 0.0, d), 1.7) * vAlpha;
+          if (a < 0.01) discard;
+          gl_FragColor = vec4(vColor * a, a);
+        }`,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+
+    // ───────────── Partículas del logo ─────────────
+    const base = sampleText(TEXT, COUNT);
+    const pos = new Float32Array(COUNT * 3);
+    const vel = new Float32Array(COUNT * 3);
+    const energy = new Float32Array(COUNT);
+    const colors = new Float32Array(COUNT * 3);
+    const sizes = new Float32Array(COUNT);
+    const phase = new Float32Array(COUNT);
+
+    const pal = PALETTE.map(c => new THREE.Color(c));
+    const tmp = new THREE.Color();
+    for (let i = 0; i < COUNT; i++) {
+      // Empiezan dispersas en una esfera grande y se ensamblan
+      const r = 60 + Math.random() * 60;
+      const th = Math.random() * Math.PI * 2, ph = Math.acos(2 * Math.random() - 1);
+      pos[i * 3]     = r * Math.sin(ph) * Math.cos(th);
+      pos[i * 3 + 1] = r * Math.sin(ph) * Math.sin(th);
+      pos[i * 3 + 2] = r * Math.cos(ph);
+
+      const t = THREE.MathUtils.clamp(base[i * 3] + 0.5, 0, 1) * (pal.length - 1);
+      const j = Math.min(pal.length - 2, Math.floor(t));
+      tmp.copy(pal[j]).lerp(pal[j + 1], t - j);
+      const shade = 0.75 + Math.random() * 0.35;
+      colors[i * 3] = tmp.r * shade; colors[i * 3 + 1] = tmp.g * shade; colors[i * 3 + 2] = tmp.b * shade;
+
+      sizes[i] = 0.6 + Math.random() * 0.9;
+      phase[i] = Math.random() * Math.PI * 2;
+    }
+
+    const geo = new THREE.BufferGeometry();
+    const posAttr = new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage);
+    const energyAttr = new THREE.BufferAttribute(energy, 1).setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute('position', posAttr);
+    geo.setAttribute('aEnergy', energyAttr);
+    geo.setAttribute('aColor', new THREE.BufferAttribute(colors, 3));
+    geo.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
+    geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 200);
+
+    const logo = new THREE.Points(geo, particleMaterial(isMobile ? 2.6 : 3.0));
+    const logoGroup = new THREE.Group();
+    logoGroup.add(logo);
+    scene.add(logoGroup);
+
+    // ───────────── Polvo ambiental ─────────────
+    const aPos = new Float32Array(AMBIENT * 3);
+    const aCol = new Float32Array(AMBIENT * 3);
+    const aSize = new Float32Array(AMBIENT);
+    for (let i = 0; i < AMBIENT; i++) {
+      aPos[i * 3]     = (Math.random() - 0.5) * 220;
+      aPos[i * 3 + 1] = (Math.random() - 0.5) * 140;
+      aPos[i * 3 + 2] = (Math.random() - 0.5) * 160 - 20;
+      tmp.copy(pal[(Math.random() * pal.length) | 0]).multiplyScalar(0.35);
+      aCol[i * 3] = tmp.r; aCol[i * 3 + 1] = tmp.g; aCol[i * 3 + 2] = tmp.b;
+      aSize[i] = 0.5 + Math.random() * 1.2;
+    }
+    const aGeo = new THREE.BufferGeometry();
+    aGeo.setAttribute('position', new THREE.BufferAttribute(aPos, 3));
+    aGeo.setAttribute('aColor', new THREE.BufferAttribute(aCol, 3));
+    aGeo.setAttribute('aSize', new THREE.BufferAttribute(aSize, 1));
+    aGeo.setAttribute('aEnergy', new THREE.BufferAttribute(new Float32Array(AMBIENT), 1));
+    const dust = new THREE.Points(aGeo, particleMaterial(2.2));
+    scene.add(dust);
+
+    // ───────────── Tamaño y escala ─────────────
+    let scale = 1;
+    function resize() {
+      const w = innerWidth, h = innerHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+      composer.setSize(w, h);
+      bloom.setSize(w, h);
+      const visH = 2 * camera.position.z * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+      const visW = visH * camera.aspect;
+      scale = Math.min(70, visW * 0.84);   // ancho del texto en unidades del mundo
+    }
+    addEventListener('resize', resize);
+    resize();
+
+    // ───────────── Interacción ─────────────
+    const ndc = new THREE.Vector2(9, 9);
+    const pointer = { active: false, local: new THREE.Vector3(1e5, 1e5, 0), downT: 0, downX: 0, downY: 0 };
+    const raycaster = new THREE.Raycaster();
+    const ray = new THREE.Ray();
+    const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+    const inv = new THREE.Matrix4();
+    const hint = document.getElementById('hint');
+    let hinted = false;
+
+    function setPointer(e) {
+      ndc.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+      pointer.active = true;
+      if (!hinted) { hinted = true; setTimeout(() => (hint.style.opacity = 0), 2500); }
+    }
+    const el = renderer.domElement;
+    el.addEventListener('pointermove', setPointer);
+    el.addEventListener('pointerdown', e => {
+      setPointer(e);
+      pointer.downT = performance.now(); pointer.downX = e.clientX; pointer.downY = e.clientY;
+    });
+    el.addEventListener('pointerup', e => {
+      const quick = performance.now() - pointer.downT < 300;
+      const still = Math.hypot(e.clientX - pointer.downX, e.clientY - pointer.downY) < 12;
+      if (quick && still) explode();
+      if (e.pointerType !== 'mouse') pointer.active = false;
+    });
+    el.addEventListener('pointerleave', () => (pointer.active = false));
+
+    let assembleFrom = performance.now() / 1000;   // la intro cuenta como una "explosión"
+    function explode() {
+      const m = pointer.local;
+      for (let i = 0; i < COUNT; i++) {
+        const k = i * 3;
+        let dx = pos[k] - m.x, dy = pos[k + 1] - m.y, dz = pos[k + 2] + (Math.random() - 0.5) * 4;
+        const d = Math.hypot(dx, dy, dz) || 1;
+        const f = (1.2 + Math.random() * 2.2) * Math.min(1, 30 / (d + 6)) + 0.4;
+        vel[k] += (dx / d) * f; vel[k + 1] += (dy / d) * f; vel[k + 2] += (dz / d) * f * 1.4;
+      }
+      assembleFrom = performance.now() / 1000 + 0.35;
+    }
+
+    // ───────────── Bucle principal ─────────────
+    const clock = new THREE.Clock();
+    const rot = { x: 0, y: 0 };
+
+    function tick() {
+      const dt = Math.min(clock.getDelta(), 1 / 30) * 60;   // normalizado a 60 fps
+      const t = clock.elapsedTime;
+      const now = performance.now() / 1000;
+
+      // Inclinación suave hacia el puntero
+      const tx = pointer.active ? -ndc.y * 0.18 : Math.sin(t * 0.3) * 0.05;
+      const ty = pointer.active ?  ndc.x * 0.32 : Math.sin(t * 0.21) * 0.12;
+      rot.x += (tx - rot.x) * 0.04 * dt;
+      rot.y += (ty - rot.y) * 0.04 * dt;
+      logoGroup.rotation.set(rot.x, rot.y, 0);
+      logoGroup.updateMatrixWorld();
+
+      // Puntero → plano local del logo
+      if (pointer.active) {
+        raycaster.setFromCamera(ndc, camera);
+        inv.copy(logoGroup.matrixWorld).invert();
+        ray.copy(raycaster.ray).applyMatrix4(inv);
+        if (!ray.intersectPlane(plane, pointer.local)) pointer.local.set(1e5, 1e5, 0);
+      } else {
+        pointer.local.set(1e5, 1e5, 0);
+      }
+      const mx = pointer.local.x, my = pointer.local.y;
+
+      // Fuerza del resorte: se recupera poco a poco tras una explosión
+      const s = THREE.MathUtils.smoothstep(now - assembleFrom, 0, 2.2);
+      const K = (0.004 + 0.032 * s) * dt;
+      const damp = Math.pow(0.9 - 0.04 * (1 - s), dt);
+      const R = scale * 0.11, R2 = R * R;
+      const push = 1.6 * dt;
+
+      for (let i = 0; i < COUNT; i++) {
+        const k = i * 3;
+        const ph = phase[i];
+        const bx = base[k] * scale, by = base[k + 1] * scale;
+        const bz = base[k + 2] * scale + Math.sin(t * 0.9 + bx * 0.12 + ph * 0.3) * 0.7;
+
+        let vx = vel[k], vy = vel[k + 1], vz = vel[k + 2];
+        const px = pos[k], py = pos[k + 1], pz = pos[k + 2];
+
+        vx += (bx - px) * K; vy += (by - py) * K; vz += (bz - pz) * K;
+
+        // Repulsión del puntero, con un ligero remolino
+        const dx = px - mx, dy = py - my;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < R2) {
+          const d = Math.sqrt(d2) + 1e-4;
+          const f = (1 - d / R); const ff = f * f * push;
+          vx += (dx / d) * ff - (dy / d) * ff * 0.35;
+          vy += (dy / d) * ff + (dx / d) * ff * 0.35;
+          vz += ff * 0.9 * Math.sin(ph);
+        }
+
+        vx *= damp; vy *= damp; vz *= damp;
+        vel[k] = vx; vel[k + 1] = vy; vel[k + 2] = vz;
+        pos[k] = px + vx * dt; pos[k + 1] = py + vy * dt; pos[k + 2] = pz + vz * dt;
+
+        const sp = Math.sqrt(vx * vx + vy * vy + vz * vz);
+        energy[i] = Math.max(Math.min(1, sp * 0.9), energy[i] * Math.pow(0.95, dt));
+      }
+      posAttr.needsUpdate = true;
+      energyAttr.needsUpdate = true;
+
+      dust.rotation.y = t * 0.015;
+      dust.rotation.x = Math.sin(t * 0.05) * 0.05;
+
+      composer.render();
+      requestAnimationFrame(tick);
+    }
+    tick();
+  </script>
+</body>
+</html>
